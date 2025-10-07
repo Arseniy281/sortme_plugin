@@ -1,0 +1,18 @@
+{
+    "name": "sortme-plugin",
+    "displayName": "Sort-me.org Plugin",
+    "description": "Submit solutions to sort-me.org",
+    "version": "1.0.0",
+    "engines": {
+        "vscode": "^1.60.0"
+    },
+    "categories": ["Other"],
+    "activationEvents": [],
+    "main": "./sortme",
+    "contributes": {
+        "commands": [{
+            "command": "sortme.submit",
+            "title": "Sort-me: Submit Solution"
+        }]
+    }
+}
