@@ -208,6 +208,11 @@ func (v *VSCodeExtension) createListCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "list",
 		Short: "Список последних отправок",
+		Long: `Показать список последних отправок
+
+Примеры:
+  sortme list          # 10 последних отправок
+  sortme list --limit 20  # 20 последних отправок`,
 		Run: func(cmd *cobra.Command, args []string) {
 			v.handleList(limit)
 		},
@@ -330,6 +335,22 @@ func (v *VSCodeExtension) handleSubmit(filename, contestID, problemID, language 
 	fmt.Printf("sortme status %s\n", response.ID)
 }
 
+func (a *APIClient) GetSubmissionStatus(submissionID string) (*SubmissionStatus, error) {
+	if !a.IsAuthenticated() {
+		return nil, fmt.Errorf("not authenticated")
+	}
+
+	// Сначала пробуем REST
+	status, err := a.tryRESTStatus(submissionID)
+	if err == nil {
+		return status, nil
+	}
+
+	// Если REST не работает, используем WebSocket
+	fmt.Printf("🔌 Подключаемся к WebSocket для статуса %s\n", submissionID)
+	return a.getStatusViaWebSocket(submissionID)
+}
+
 func (v *VSCodeExtension) handleStatus(submissionID string) {
 	if !v.apiClient.IsAuthenticated() {
 		fmt.Println("❌ Вы не аутентифицированы")
@@ -370,12 +391,11 @@ func (v *VSCodeExtension) handleList(limit int) {
 		return
 	}
 
-	fmt.Printf("📋 Получение последних %d отправок...\n", limit)
+	fmt.Printf("📋 Получение %d последних отправок...\n\n", limit)
 
 	submissions, err := v.apiClient.GetSubmissions(limit)
 	if err != nil {
 		fmt.Printf("❌ Ошибка получения списка отправок: %v\n", err)
-		fmt.Println("🔍 Попробуйте исследовать API с помощью: sortme explore")
 		return
 	}
 
@@ -384,37 +404,149 @@ func (v *VSCodeExtension) handleList(limit int) {
 		return
 	}
 
-	fmt.Printf("\n📊 Последние %d отправок (задача 2472, контест 456):\n", len(submissions))
-	fmt.Println("┌──────────┬────────────┬────────┬──────────────┐")
-	fmt.Println("│    ID    │   Статус   │ Баллы  │    Детали    │")
-	fmt.Println("├──────────┼────────────┼────────┼──────────────┤")
+	fmt.Printf("\n📊 Последние %d отправок:\n", len(submissions))
+
+	// Определяем максимальную ширину для названия задачи
+	maxTaskWidth := 35
+	for _, sub := range submissions {
+		taskName := getTaskDisplayName(sub)
+		if len(taskName) > maxTaskWidth {
+			maxTaskWidth = len(taskName)
+		}
+	}
+	if maxTaskWidth > 50 {
+		maxTaskWidth = 50
+	}
+
+	// Строим динамическую таблицу
+	headerFormat := "┌──────────┬────────────┬─%s┬────────┬─────────────────┬─────────────────┐\n"
+	taskHeader := strings.Repeat("─", maxTaskWidth+2)
+	fmt.Printf(headerFormat, taskHeader)
+
+	fmt.Printf("│    ID    │   Контест  │ %-*s │ Статус │    Вердикт      │    Баллы        │\n",
+		maxTaskWidth, "Задача")
+
+	separatorFormat := "├──────────┼────────────┼─%s┼────────┼─────────────────┼─────────────────┤\n"
+	fmt.Printf(separatorFormat, strings.Repeat("─", maxTaskWidth+2))
 
 	for _, sub := range submissions {
 		statusEmoji := getShortStatusEmoji(sub.ShownVerdict)
-		statusText := getStatusText(sub.ShownVerdict)
 
-		details := ""
-		if sub.ShownTest > 0 {
-			details = fmt.Sprintf("Тест %d", sub.ShownTest)
+		// Форматируем данные для таблицы
+		contestDisplay := sub.ContestID
+		if contestDisplay == "" {
+			contestDisplay = "?"
 		}
 
-		fmt.Printf("│ %-8d │ %-2s %-8s │ %-6d │ %-12s │\n",
+		// Название задачи
+		taskDisplay := getTaskDisplayName(sub)
+		if len(taskDisplay) > maxTaskWidth {
+			taskDisplay = taskDisplay[:maxTaskWidth-2] + ".."
+		}
+
+		verdict := getShortVerdict(sub.ShownVerdictText)
+		points := sub.TotalPoints
+		if points == 0 && sub.ShownVerdict == 1 {
+			points = 100
+		}
+
+		fmt.Printf("│ %-8d │ %-10s │ %-*s │ %-2s %-4s │ %-15s │ %-15d │\n",
 			sub.ID,
+			contestDisplay,
+			maxTaskWidth,
+			taskDisplay,
 			statusEmoji,
-			statusText,
-			sub.TotalPoints,
-			details,
+			"",
+			verdict,
+			points,
 		)
 	}
-	fmt.Println("└──────────┴────────────┴────────┴──────────────┘")
 
-	// Показываем ссылки для детального просмотра
-	fmt.Println("\n🔍 Для детальной информации используйте:")
-	for i, sub := range submissions {
-		if i < 3 { // Показываем только первые 3
-			fmt.Printf("  sortme status %d\n", sub.ID)
+	footerFormat := "└──────────┴────────────┴─%s┴────────┴─────────────────┴─────────────────┘\n"
+	fmt.Printf(footerFormat, strings.Repeat("─", maxTaskWidth+2))
+
+	// Статистика
+	successCount := 0
+	for _, sub := range submissions {
+		if sub.ShownVerdict == 1 {
+			successCount++
 		}
 	}
+
+	fmt.Printf("\n📈 Статистика: %d/%d успешных отправок\n", successCount, len(submissions))
+
+	// Показываем ссылки для детального просмотра
+	if len(submissions) > 0 {
+		fmt.Println("\n🔍 Для детальной информации:")
+		for i := 0; i < len(submissions) && i < 3; i++ {
+			fmt.Printf("  sortme status %d\n", submissions[i].ID)
+		}
+	}
+}
+
+func getShortVerdict(verdict string) string {
+	// Убедимся, что работаем с UTF-8 строками
+	if len(verdict) <= 15 {
+		return verdict
+	}
+
+	// Сокращаем длинные вердикты
+	shortVerdicts := map[string]string{
+		"Полное решение":                "Принято",
+		"Ошибка при компиляции":         "Ошибка компиляции",
+		"Неверный ответ":                "Неправильный ответ",
+		"Превышено ограничение времени": "Тайм-лимит",
+		"Превышено ограничение памяти":  "Мемори-лимит",
+	}
+
+	if short, exists := shortVerdicts[verdict]; exists {
+		return short
+	}
+
+	// Для русских текстов обрезаем правильно
+	runes := []rune(verdict)
+	if len(runes) > 15 {
+		return string(runes[:14]) + "…"
+	}
+	return verdict
+}
+
+func getTaskDisplayName(sub Submission) string {
+	if sub.ProblemName != "" {
+		// Убедимся, что русские символы отображаются правильно
+		return fmt.Sprintf("%d. %s", sub.ProblemID, sub.ProblemName)
+	}
+	return fmt.Sprintf("%d", sub.ProblemID)
+}
+
+// Вспомогательные функции для форматирования
+func shortenText(text string, maxLength int) string {
+	if len(text) <= maxLength {
+		return text
+	}
+	return text[:maxLength-2] + ".."
+}
+
+func formatSubmitTime(timeStr string) string {
+	// Пробуем разные форматы времени
+	formats := []string{
+		time.RFC3339,
+		"2006-01-02 15:04:05",
+		"2006-01-02T15:04:05Z",
+		"02.01.2006 15:04:05",
+	}
+
+	for _, format := range formats {
+		if t, err := time.Parse(format, timeStr); err == nil {
+			return t.Format("02.01 15:04")
+		}
+	}
+
+	// Если не удалось распарсить, возвращаем как есть (обрезаем)
+	if len(timeStr) > 16 {
+		return timeStr[:16]
+	}
+	return timeStr
 }
 
 func (v *VSCodeExtension) handleContests() {
@@ -492,15 +624,18 @@ func (a *APIClient) IsTaskSolved(contestID string, taskID int) (bool, error) {
 
 	endpoint := fmt.Sprintf("/getMySubmissionsByTask?id=%d&contestid=%s", taskID, contestID)
 
-	submissions, err := a.tryGetSubmissions(endpoint)
+	// Добавляем лимит 0 (без ограничения)
+	submissions, err := a.tryGetSubmissions(endpoint, 0)
 	if err != nil {
 		return false, err
 	}
 
-	// Если есть отправки, проверяем последнюю
-	if len(submissions) > 0 {
-		lastSubmission := submissions[0]
-		return lastSubmission.ShownVerdict == 1 && lastSubmission.TotalPoints == 100, nil
+	// Проверяем ВСЕ отправки, а не только последнюю
+	// Задача считается решенной если была хотя бы одна успешная отправка
+	for _, submission := range submissions {
+		if submission.ShownVerdict == 1 && submission.TotalPoints == 100 {
+			return true, nil
+		}
 	}
 
 	return false, nil
@@ -529,19 +664,22 @@ func (v *VSCodeExtension) handleProblems(contestID string) {
 
 	// Сначала собираем все статусы
 	taskStatuses := make([]string, len(contestInfo.Tasks))
+	solvedCount := 0
 
 	for i, task := range contestInfo.Tasks {
 		// Добавляем задержку чтобы избежать rate limiting
 		if i > 0 {
-			time.Sleep(500 * time.Millisecond)
+			time.Sleep(300 * time.Millisecond)
 		}
 
 		solved, err := v.apiClient.IsTaskSolved(contestID, task.ID)
 		status := "🔓"
-		if err == nil && solved {
-			status = "✅"
-		} else if err != nil {
+		if err != nil {
 			status = "❓" // Неизвестно из-за ошибки
+			fmt.Printf("  ⚠️  Ошибка проверки задачи %d: %v\n", task.ID, err)
+		} else if solved {
+			status = "✅"
+			solvedCount++
 		}
 
 		taskStatuses[i] = status
@@ -549,20 +687,36 @@ func (v *VSCodeExtension) handleProblems(contestID string) {
 
 	// Теперь красивый вывод
 	for i, task := range contestInfo.Tasks {
-		fmt.Printf("  %s %d. %s (ID: %d)\n", taskStatuses[i], i+1, task.Name, task.ID)
+		status := taskStatuses[i]
+		fmt.Printf("  %s %d. %s (ID: %d)\n", status, i+1, task.Name, task.ID)
 	}
 
 	fmt.Printf("\n💡 Для отправки решения используйте:\n")
 	fmt.Printf("   sortme submit файл.cpp -c %s -p ID_задачи\n", contestID)
 
 	// Статистика
-	solvedCount := 0
-	for _, status := range taskStatuses {
-		if status == "✅" {
-			solvedCount++
+	totalCount := len(contestInfo.Tasks)
+	fmt.Printf("\n📊 Прогресс: %d/%d задач решено", solvedCount, totalCount)
+
+	if totalCount > 0 {
+		percent := (solvedCount * 100) / totalCount
+		fmt.Printf(" (%d%%)", percent)
+
+		// Progress bar
+		barLength := 20
+		filled := (solvedCount * barLength) / totalCount
+		empty := barLength - filled
+
+		fmt.Printf("\n   [")
+		for i := 0; i < filled; i++ {
+			fmt.Printf("█")
 		}
+		for i := 0; i < empty; i++ {
+			fmt.Printf("░")
+		}
+		fmt.Printf("]")
 	}
-	fmt.Printf("\n📊 Прогресс: %d/%d задач решено\n", solvedCount, len(contestInfo.Tasks))
+	fmt.Println()
 }
 
 func (v *VSCodeExtension) handleDownload(contestID, problemID string) {

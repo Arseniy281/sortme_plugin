@@ -9,8 +9,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -83,6 +83,11 @@ type Submission struct {
 	ProblemID        int    `json:"problem_id,omitempty"`
 	Language         string `json:"language,omitempty"`
 	Time             string `json:"time,omitempty"`
+	ProblemName      string `json:"problem_name,omitempty"`
+	ContestName      string `json:"contest_name,omitempty"`
+	SubmitTime       string `json:"submit_time,omitempty"`
+	TaskID           int    `json:"task_id,omitempty"`
+	TaskName         string `json:"task_name,omitempty"`
 }
 
 type SubmissionsResponse struct {
@@ -205,22 +210,6 @@ func (a *APIClient) SubmitSolution(contestID, problemID, language, sourceCode st
 	return &apiResponse, nil
 }
 
-func (a *APIClient) GetSubmissionStatus(submissionID string) (*SubmissionStatus, error) {
-	if !a.IsAuthenticated() {
-		return nil, fmt.Errorf("not authenticated")
-	}
-
-	// Сначала пробуем REST
-	status, err := a.tryRESTStatus(submissionID)
-	if err == nil {
-		return status, nil
-	}
-
-	// Если REST не работает, используем WebSocket
-	fmt.Printf("🔌 Подключаемся к WebSocket для статуса %s\n", submissionID)
-	return a.getStatusViaWebSocket(submissionID)
-}
-
 func (a *APIClient) getStatusViaWebSocket(submissionID string) (*SubmissionStatus, error) {
 	// Создаем WebSocket URL
 	wsURL := "wss://api.sort-me.org/ws/submission?id=" + submissionID + "&token=" + a.config.SessionToken
@@ -295,117 +284,6 @@ func (a *APIClient) getStatusViaWebSocket(submissionID string) (*SubmissionStatu
 	}
 }
 
-func (a *APIClient) tryContestEndpoint(endpoint string) ([]Contest, error) {
-	req, err := http.NewRequest("GET", a.baseURL+endpoint, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	req.Header.Set("Authorization", "Bearer "+a.config.SessionToken)
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := a.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
-	}
-
-	body, _ := io.ReadAll(resp.Body)
-	return a.parseContestResponse(body, endpoint)
-}
-
-func (a *APIClient) parseContestResponse(body []byte, endpoint string) ([]Contest, error) {
-	fmt.Printf("🔍 Парсим ответ от %s\n", endpoint)
-
-	// 1. Для getUpcomingContests - это массив предстоящих контестов
-	if strings.Contains(endpoint, "getUpcomingContests") {
-		var upcomingContests []struct {
-			ID                 int    `json:"id"`
-			Name               string `json:"name"`
-			Starts             int64  `json:"starts"`
-			Ends               int64  `json:"ends"`
-			OrgName            string `json:"org_name"`
-			Running            bool   `json:"running"`
-			RegistrationOpened bool   `json:"registration_opened"`
-			Ended              bool   `json:"ended"`
-		}
-
-		if err := json.Unmarshal(body, &upcomingContests); err == nil && len(upcomingContests) > 0 {
-			fmt.Printf("✅ Найдено %d предстоящих/активных контестов\n", len(upcomingContests))
-
-			var contests []Contest
-			for _, uc := range upcomingContests {
-				status := "upcoming"
-				if uc.Running {
-					status = "active"
-				} else if uc.Ended {
-					status = "ended"
-				}
-
-				contests = append(contests, Contest{
-					ID:      fmt.Sprintf("%d", uc.ID),
-					Name:    uc.Name,
-					Status:  status,
-					Started: uc.Running,
-				})
-			}
-			return contests, nil
-		}
-	}
-
-	// 2. Для getArchiveCategories - это объект с категориями архива
-	if strings.Contains(endpoint, "getArchiveCategories") {
-		var categories map[string]int
-		if err := json.Unmarshal(body, &categories); err == nil && len(categories) > 0 {
-			fmt.Printf("✅ Найдено %d архивных категорий\n", len(categories))
-
-			var contests []Contest
-			for categoryName := range categories {
-				contests = append(contests, Contest{
-					ID:     fmt.Sprintf("archive_%s", categoryName),
-					Name:   fmt.Sprintf("Архив: %s", categoryName),
-					Status: "archive",
-				})
-			}
-			return contests, nil
-		}
-	}
-
-	// 3. Для getArchivePreviews - это объект с архивными олимпиадами
-	if strings.Contains(endpoint, "getArchivePreviews") {
-		var archiveResponse struct {
-			Count int `json:"count"`
-			Items []struct {
-				ID            int    `json:"id"`
-				Name          string `json:"name"`
-				Category      string `json:"category"`
-				SolvedPercent int    `json:"solved_percent"`
-				Seasons       int    `json:"seasons"`
-			} `json:"items"`
-		}
-
-		if err := json.Unmarshal(body, &archiveResponse); err == nil && len(archiveResponse.Items) > 0 {
-			fmt.Printf("✅ Найдено %d архивных олимпиад\n", len(archiveResponse.Items))
-
-			var contests []Contest
-			for _, item := range archiveResponse.Items {
-				contests = append(contests, Contest{
-					ID:     fmt.Sprintf("archive_%d", item.ID),
-					Name:   fmt.Sprintf("%s (%s)", item.Name, item.Category),
-					Status: "archive",
-				})
-			}
-			return contests, nil
-		}
-	}
-
-	return nil, fmt.Errorf("неизвестный формат ответа")
-}
-
 func (a *APIClient) addKnownContests(contests []Contest) []Contest {
 	knownContests := map[string]Contest{
 		"456": {
@@ -431,11 +309,7 @@ func (a *APIClient) addKnownContests(contests []Contest) []Contest {
 	// Добавляем отсутствующие известные контесты
 	for id, contest := range knownContests {
 		if !existingIDs[id] {
-			// Проверяем доступность контеста
-			if a.isContestAccessible(id) {
-				contests = append(contests, contest)
-				fmt.Printf("✅ Добавлен известный контест: %s\n", contest.Name)
-			}
+			contests = append(contests, contest)
 		}
 	}
 
@@ -633,30 +507,179 @@ func (a *APIClient) tryGetStatus(endpoint string) (*SubmissionStatus, error) {
 }
 
 // Методы для списка отправок
+// Методы для списка отправок
 func (a *APIClient) GetSubmissions(limit int) ([]Submission, error) {
 	if !a.IsAuthenticated() {
 		return nil, fmt.Errorf("not authenticated")
 	}
 
-	// Используем найденный endpoint для конкретной задачи
-	endpoint := "/getMySubmissionsByTask?id=2472&contestid=456"
+	// Получаем отправки только из активных контестов
+	return a.getAllSubmissions(limit)
+}
 
-	fmt.Printf("🔍 Используем endpoint: %s\n", endpoint)
+// Получить отправки для задачи во всех контестах
+func (a *APIClient) getSubmissionsByTaskAcrossContests(taskID string, limit int) ([]Submission, error) {
+	fmt.Printf("🌐 Получение списка контестов для поиска задачи %s...\n", taskID)
 
-	submissions, err := a.tryGetSubmissions(endpoint)
+	contests, err := a.GetContests()
+	if err != nil {
+		return nil, fmt.Errorf("не удалось получить список контестов: %w", err)
+	}
+
+	var allSubmissions []Submission
+
+	// Ограничиваем количество проверяемых контестов для производительности
+	maxContests := 10
+	if len(contests) > maxContests {
+		fmt.Printf("📊 Ограничиваем проверку до %d последних контестов\n", maxContests)
+		contests = contests[:maxContests]
+	}
+
+	for i, contest := range contests {
+		fmt.Printf("🔍 Проверяем контест %d/%d (ID: %s)...\n", i+1, len(contests), contest.ID)
+
+		// Проверяем существует ли задача в этом контесте
+		contestInfo, err := a.GetContestInfo(contest.ID)
+		if err != nil {
+			continue
+		}
+
+		// Ищем задачу с нужным ID
+		taskExists := false
+		for _, task := range contestInfo.Tasks {
+			if fmt.Sprintf("%d", task.ID) == taskID {
+				taskExists = true
+				break
+			}
+		}
+
+		if taskExists {
+			fmt.Printf("✅ Задача %s найдена в контесте %s\n", taskID, contest.ID)
+			taskSubmissions, err := a.tryGetSubmissions(fmt.Sprintf("/getMySubmissionsByTask?id=%s&contestid=%s", taskID, contest.ID), 0)
+			if err != nil {
+				fmt.Printf("⚠️  Ошибка получения отправок: %v\n", err)
+				continue
+			}
+
+			// Добавляем информацию о контесте к каждой отправке
+			for j := range taskSubmissions {
+				taskSubmissions[j].ProblemID, _ = strconv.Atoi(taskID)
+				taskSubmissions[j].ContestID = contest.ID
+				taskSubmissions[j].ContestName = contest.Name
+			}
+
+			allSubmissions = append(allSubmissions, taskSubmissions...)
+
+			// Если нашли достаточно отправок, можно остановиться
+			if limit > 0 && len(allSubmissions) >= limit {
+				break
+			}
+		}
+	}
+
+	// Сортируем по ID (более новые сначала)
+	sort.Slice(allSubmissions, func(i, j int) bool {
+		return allSubmissions[i].ID > allSubmissions[j].ID
+	})
+
+	// Применяем лимит
+	if limit > 0 && limit < len(allSubmissions) {
+		return allSubmissions[:limit], nil
+	}
+
+	return allSubmissions, nil
+}
+
+// Получить отправки для конкретного контеста
+// Получить отправки для конкретного контеста
+func (a *APIClient) getSubmissionsByContest(contestID string, limit int) ([]Submission, error) {
+	contestInfo, err := a.GetContestInfo(contestID)
 	if err != nil {
 		return nil, err
 	}
 
-	// Ограничиваем количество результатов
-	if limit > 0 && limit < len(submissions) {
-		return submissions[:limit], nil
+	var allSubmissions []Submission
+
+	fmt.Printf("📚 Задачи контеста (%d): ", len(contestInfo.Tasks))
+
+	// Последовательно получаем отправки для каждой задачи
+	for i, task := range contestInfo.Tasks {
+		// Увеличиваем задержку чтобы избежать rate limiting
+		if i > 0 {
+			time.Sleep(200 * time.Millisecond) // Увеличили до 200мс
+		}
+
+		taskSubmissions, err := a.tryGetSubmissions(fmt.Sprintf("/getMySubmissionsByTask?id=%d&contestid=%s", task.ID, contestID), 0)
+		if err != nil {
+			fmt.Printf("❌") // Просто крестик без текста
+			continue
+		}
+
+		fmt.Printf("✅") // Галочка для успешной загрузки
+
+		// Добавляем информацию о задаче к каждой отправке
+		for j := range taskSubmissions {
+			taskSubmissions[j].ProblemID = task.ID
+			taskSubmissions[j].ProblemName = task.Name
+			taskSubmissions[j].ContestID = contestID
+			taskSubmissions[j].ContestName = contestInfo.Name
+		}
+
+		allSubmissions = append(allSubmissions, taskSubmissions...)
 	}
 
-	return submissions, nil
+	// Сортируем по ID (более новые сначала)
+	sort.Slice(allSubmissions, func(i, j int) bool {
+		return allSubmissions[i].ID > allSubmissions[j].ID
+	})
+
+	fmt.Printf(" | %d отправок\n", len(allSubmissions))
+
+	// Применяем лимит
+	if limit > 0 && limit < len(allSubmissions) {
+		return allSubmissions[:limit], nil
+	}
+
+	return allSubmissions, nil
 }
 
-func (a *APIClient) tryGetSubmissions(endpoint string) ([]Submission, error) {
+// Получить все отправки (через известные контесты)
+func (a *APIClient) getAllSubmissions(limit int) ([]Submission, error) {
+	// Получаем только активные контесты
+	contests, err := a.GetContests()
+	if err != nil {
+		return nil, fmt.Errorf("не удалось получить список контестов: %w", err)
+	}
+
+	var allSubmissions []Submission
+
+	for i, contest := range contests {
+		fmt.Printf("🔍 Контест %d/%d: %s\n", i+1, len(contests), contest.Name)
+
+		contestSubmissions, err := a.getSubmissionsByContest(contest.ID, 0)
+		if err != nil {
+			continue
+		}
+
+		allSubmissions = append(allSubmissions, contestSubmissions...)
+	}
+
+	// Сортируем по ID (более новые сначала)
+	sort.Slice(allSubmissions, func(i, j int) bool {
+		return allSubmissions[i].ID > allSubmissions[j].ID
+	})
+
+	fmt.Printf("\n🎯 Итого: %d отправок\n", len(allSubmissions))
+
+	// Применяем лимит
+	if limit > 0 && limit < len(allSubmissions) {
+		return allSubmissions[:limit], nil
+	}
+
+	return allSubmissions, nil
+}
+
+func (a *APIClient) tryGetSubmissions(endpoint string, limit int) ([]Submission, error) {
 	req, err := http.NewRequest("GET", a.baseURL+endpoint, nil)
 	if err != nil {
 		return nil, err
@@ -672,14 +695,37 @@ func (a *APIClient) tryGetSubmissions(endpoint string) ([]Submission, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("status %d", resp.StatusCode)
+		// Для 404 возвращаем пустой список
+		if resp.StatusCode == 404 {
+			return []Submission{}, nil
+		}
+		// Для 429 (Too Many Requests) просто возвращаем пустой список
+		if resp.StatusCode == 429 {
+			return []Submission{}, fmt.Errorf("rate limit")
+		}
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 
 	body, _ := io.ReadAll(resp.Body)
 
-	var response SubmissionsResponse
+	// Парсим ответ в правильном формате
+	var response struct {
+		Count       int          `json:"count"`
+		Submissions []Submission `json:"submissions"`
+	}
+
 	if err := json.Unmarshal(body, &response); err != nil {
-		return nil, fmt.Errorf("failed to parse response: %w", err)
+		return nil, err
+	}
+
+	// Сортируем по ID (более новые сначала)
+	sort.Slice(response.Submissions, func(i, j int) bool {
+		return response.Submissions[i].ID > response.Submissions[j].ID
+	})
+
+	// Ограничиваем количество результатов
+	if limit > 0 && limit < len(response.Submissions) {
+		return response.Submissions[:limit], nil
 	}
 
 	return response.Submissions, nil
@@ -733,33 +779,76 @@ func (a *APIClient) GetContests() ([]Contest, error) {
 		return nil, fmt.Errorf("not authenticated")
 	}
 
-	// Реальные endpoints из исследования
-	endpoints := []struct {
-		path string
-		name string
-	}{
-		{"/getUpcomingContests", "предстоящие контесты"},
-		{"/getArchiveCategories", "архивные категории"},
-		{"/getArchivePreviews?hidesolved=1&category=0&offset=0", "архивные олимпиады"},
-	}
+	// Используем только endpoint для предстоящих контестов
+	endpoint := "/getUpcomingContests"
 
-	var allContests []Contest
-
-	for _, endpoint := range endpoints {
-		contests, err := a.tryContestEndpoint(endpoint.path)
-		if err == nil && len(contests) > 0 {
-			allContests = append(allContests, contests...)
-		}
-	}
-
-	// Добавляем известные контесты если их нет в списке
-	allContests = a.addKnownContests(allContests)
-
-	if len(allContests) == 0 {
+	req, err := http.NewRequest("GET", a.baseURL+endpoint, nil)
+	if err != nil {
 		return a.getFallbackContests(), nil
 	}
 
-	return allContests, nil
+	req.Header.Set("Authorization", "Bearer "+a.config.SessionToken)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return a.getFallbackContests(), nil
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return a.getFallbackContests(), nil
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+
+	// Парсим ответ
+	var upcomingContests []struct {
+		ID                 int    `json:"id"`
+		Name               string `json:"name"`
+		Starts             int64  `json:"starts"`
+		Ends               int64  `json:"ends"`
+		OrgName            string `json:"org_name"`
+		Running            bool   `json:"running"`
+		RegistrationOpened bool   `json:"registration_opened"`
+		Ended              bool   `json:"ended"`
+	}
+
+	var contests []Contest
+	if err := json.Unmarshal(body, &upcomingContests); err == nil {
+		for _, uc := range upcomingContests {
+			status := "upcoming"
+			if uc.Running {
+				status = "active"
+			} else if uc.Ended {
+				status = "ended"
+			}
+
+			contests = append(contests, Contest{
+				ID:      fmt.Sprintf("%d", uc.ID),
+				Name:    uc.Name,
+				Status:  status,
+				Started: uc.Running,
+			})
+		}
+	}
+
+	// Добавляем известные контесты в любом случае
+	contests = a.addKnownContests(contests)
+
+	// Фильтруем только активные контесты
+	var activeContests []Contest
+	for _, contest := range contests {
+		if contest.Status == "active" && contest.Started {
+			activeContests = append(activeContests, contest)
+		}
+	}
+
+	if len(activeContests) == 0 {
+		return a.getFallbackContests(), nil
+	}
+
+	return activeContests, nil
 }
 
 func (a *APIClient) IsAuthenticated() bool {
