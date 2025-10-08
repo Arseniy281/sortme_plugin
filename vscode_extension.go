@@ -13,7 +13,6 @@ import (
 type VSCodeExtension struct {
 	config    *Config
 	apiClient *APIClient
-	tgAuth    *TelegramAuth
 }
 
 func NewVSCodeExtension() *VSCodeExtension {
@@ -26,7 +25,6 @@ func NewVSCodeExtension() *VSCodeExtension {
 	return &VSCodeExtension{
 		config:    config,
 		apiClient: NewAPIClient(config),
-		tgAuth:    NewTelegramAuth(config),
 	}
 }
 
@@ -39,8 +37,6 @@ func (v *VSCodeExtension) CreateRootCommand() *cobra.Command {
 
 	rootCmd.AddCommand(
 		v.createAuthCommand(),
-		v.createWebAuthCommand(),
-		v.createManualAuthCommand(),
 		v.createSubmitCommand(),
 		v.createStatusCommand(),
 		v.createWhoamiCommand(),
@@ -50,7 +46,6 @@ func (v *VSCodeExtension) CreateRootCommand() *cobra.Command {
 		v.createContestsCommand(),
 		v.createProblemsCommand(),
 		v.createDownloadCommand(),
-		v.createContestInfoCommand(),
 	)
 
 	return rootCmd
@@ -59,35 +54,8 @@ func (v *VSCodeExtension) CreateRootCommand() *cobra.Command {
 func (v *VSCodeExtension) createAuthCommand() *cobra.Command {
 	return &cobra.Command{
 		Use:   "auth",
-		Short: "Аутентификация через Telegram бота",
-		Run: func(cmd *cobra.Command, args []string) {
-			if err := v.tgAuth.StartAuth(); err != nil {
-				fmt.Printf("Ошибка аутентификации: %v\n", err)
-				os.Exit(1)
-			}
-		},
-	}
-}
-
-func (v *VSCodeExtension) createWebAuthCommand() *cobra.Command {
-	return &cobra.Command{
-		Use:   "webauth",
-		Short: "Аутентификация через веб-сайт",
-		Long:  "Альтернативный метод аутентификации через браузер",
-		Run: func(cmd *cobra.Command, args []string) {
-			if err := v.tgAuth.StartWebAuth(); err != nil {
-				fmt.Printf("Ошибка аутентификации: %v\n", err)
-				os.Exit(1)
-			}
-		},
-	}
-}
-
-func (v *VSCodeExtension) createManualAuthCommand() *cobra.Command {
-	return &cobra.Command{
-		Use:   "manualauth",
-		Short: "Ручная аутентификация",
-		Long:  "Ручной ввод данных аутентификации",
+		Short: "Аутентификация в sort-me.org",
+		Long:  "Ввод данных аутентификации для работы с sort-me.org",
 		Run: func(cmd *cobra.Command, args []string) {
 			reader := bufio.NewReader(os.Stdin)
 
@@ -157,10 +125,8 @@ func (v *VSCodeExtension) createWhoamiCommand() *cobra.Command {
 		Run: func(cmd *cobra.Command, args []string) {
 			if !v.apiClient.IsAuthenticated() {
 				fmt.Println("❌ Вы не аутентифицированы")
-				fmt.Println("Используйте одну из команд:")
-				fmt.Println("  sortme auth      - через Telegram бота")
-				fmt.Println("  sortme webauth   - через веб-сайт")
-				fmt.Println("  sortme manualauth - ручной ввод")
+				fmt.Println("Используйте команду:")
+				fmt.Println("  sortme auth - для аутентификации")
 				return
 			}
 			fmt.Printf("✅ Текущий пользователь: %s\n", v.config.Username)
@@ -283,18 +249,6 @@ func (v *VSCodeExtension) createDownloadCommand() *cobra.Command {
 			contestID := args[0]
 			problemID := args[1]
 			v.handleDownload(contestID, problemID)
-		},
-	}
-}
-
-func (v *VSCodeExtension) createContestInfoCommand() *cobra.Command {
-	return &cobra.Command{
-		Use:   "contest [contest_id]",
-		Short: "Подробная информация о контесте",
-		Args:  cobra.ExactArgs(1),
-		Run: func(cmd *cobra.Command, args []string) {
-			contestID := args[0]
-			v.handleContestInfo(contestID)
 		},
 	}
 }
@@ -469,11 +423,66 @@ func (v *VSCodeExtension) handleContests() {
 		return
 	}
 
-	// Пока используем известные контесты, позже найдем endpoint для списка
-	fmt.Println("🏆 Известные контесты:")
-	fmt.Println("  🚀 456 - Лабораторная АиСД ИТМО №2 (25/26)")
-	fmt.Println("  💡 Для просмотра задач используйте: sortme problems 456")
-	fmt.Println("\n🔍 Чтобы найти другие контесты, используйте sortme explore")
+	fmt.Println("🏆 Поиск контестов...")
+
+	contests, err := v.apiClient.GetContests()
+	if err != nil {
+		fmt.Printf("❌ Ошибка: %v\n", err)
+		return
+	}
+
+	if len(contests) == 0 {
+		fmt.Println("📭 Контесты не найдены")
+		return
+	}
+
+	// Группируем контесты по статусу
+	var active, archive []Contest
+	for _, contest := range contests {
+		if contest.Status == "active" {
+			active = append(active, contest)
+		} else if contest.Status == "archive" {
+			archive = append(archive, contest)
+		}
+	}
+
+	// Сначала показываем архивные (как вы requested)
+	if len(archive) > 0 {
+		fmt.Printf("\n📚 Архивные контесты (%d):\n", len(archive))
+		// Показываем только первые 8 архивных контестов
+		showCount := len(archive)
+		if showCount > 8 {
+			showCount = 8
+		}
+
+		for i := 0; i < showCount; i++ {
+			contest := archive[i]
+			name := contest.Name
+			if len(name) > 45 {
+				name = name[:45] + "..."
+			}
+			fmt.Printf("   🔴 %s\n", name)
+		}
+
+		if len(archive) > 8 {
+			fmt.Printf("   ... и еще %d архивных контестов\n", len(archive)-8)
+		}
+	}
+
+	// Затем активные контесты
+	if len(active) > 0 {
+		fmt.Printf("\n🎯 Актуальные контесты (%d):\n", len(active))
+		for _, contest := range active {
+			fmt.Printf("   🟢 %s (ID: %s)\n", contest.Name, contest.ID)
+		}
+	} else {
+		fmt.Println("\n🎯 Актуальные контесты: нет активных контестов")
+	}
+
+	fmt.Printf("\n💡 Команды:\n")
+	fmt.Printf("   sortme problems ID_контеста    - показать задачи контеста\n")
+	fmt.Printf("   sortme submit файл -c ID -p ID - отправить решение\n")
+	fmt.Printf("   sortme problems 456            - пример для лабораторной\n")
 }
 
 func (a *APIClient) IsTaskSolved(contestID string, taskID int) (bool, error) {
@@ -559,63 +568,6 @@ func (v *VSCodeExtension) handleProblems(contestID string) {
 func (v *VSCodeExtension) handleDownload(contestID, problemID string) {
 	fmt.Printf("🔍 Скачивание условия задачи %s из контеста %s...\n", problemID, contestID)
 	fmt.Println("⏳ Функция в разработке. Используйте sortme explore для исследования API")
-}
-
-func (v *VSCodeExtension) handleContestInfo(contestID string) {
-	if !v.apiClient.IsAuthenticated() {
-		fmt.Println("❌ Вы не аутентифицированы")
-		return
-	}
-
-	fmt.Printf("🏆 Получение информации о контесте %s...\n", contestID)
-
-	contestInfo, err := v.apiClient.GetContestInfo(contestID)
-	if err != nil {
-		fmt.Printf("❌ Ошибка: %v\n", err)
-		return
-	}
-
-	fmt.Printf("\n🏆 Контест: %s\n", contestInfo.Name)
-	fmt.Printf("   🆔 ID: %d\n", contestInfo.ID)
-	fmt.Printf("   📊 Статус: %s\n", getContestStatus(contestInfo.Starts, contestInfo.Ends))
-	fmt.Printf("   🗓️  Начало: %s\n", formatTime(contestInfo.Starts))
-	fmt.Printf("   🗓️  Окончание: %s\n", formatTime(contestInfo.Ends))
-
-	if contestInfo.Registered {
-		fmt.Printf("   ✅ Вы зарегистрированы\n")
-	} else {
-		fmt.Printf("   ❌ Вы не зарегистрированы\n")
-	}
-
-	fmt.Printf("\n📚 Задачи (%d):\n", len(contestInfo.Tasks))
-	for i, task := range contestInfo.Tasks {
-		fmt.Printf("   %d. %s (ID: %d)\n", i+1, task.Name, task.ID)
-	}
-
-	fmt.Printf("\n🚀 Команды для работы:\n")
-	fmt.Printf("   sortme problems %s    - список задач\n", contestID)
-	fmt.Printf("   sortme submit файл.cpp -c %s -p ID_задачи - отправить решение\n", contestID)
-}
-
-// Вспомогательные функции для форматирования
-func formatTime(timestamp int64) string {
-	if timestamp == 0 {
-		return "не указано"
-	}
-	t := time.Unix(timestamp, 0)
-	return t.Format("02.01.2006 15:04")
-}
-
-func getContestStatus(start, end int64) string {
-	now := time.Now().Unix()
-
-	if now < start {
-		return "🔜 Предстоит"
-	} else if now > end {
-		return "🔚 Завершен"
-	} else {
-		return "🚀 Идет сейчас"
-	}
 }
 
 func getStatusEmoji(status string) string {
