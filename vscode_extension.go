@@ -519,36 +519,6 @@ func getTaskDisplayName(sub Submission) string {
 	return fmt.Sprintf("%d", sub.ProblemID)
 }
 
-// Вспомогательные функции для форматирования
-func shortenText(text string, maxLength int) string {
-	if len(text) <= maxLength {
-		return text
-	}
-	return text[:maxLength-2] + ".."
-}
-
-func formatSubmitTime(timeStr string) string {
-	// Пробуем разные форматы времени
-	formats := []string{
-		time.RFC3339,
-		"2006-01-02 15:04:05",
-		"2006-01-02T15:04:05Z",
-		"02.01.2006 15:04:05",
-	}
-
-	for _, format := range formats {
-		if t, err := time.Parse(format, timeStr); err == nil {
-			return t.Format("02.01 15:04")
-		}
-	}
-
-	// Если не удалось распарсить, возвращаем как есть (обрезаем)
-	if len(timeStr) > 16 {
-		return timeStr[:16]
-	}
-	return timeStr
-}
-
 func (v *VSCodeExtension) handleContests() {
 	if !v.apiClient.IsAuthenticated() {
 		fmt.Println("❌ Вы не аутентифицированы")
@@ -571,7 +541,7 @@ func (v *VSCodeExtension) handleContests() {
 	// Группируем контесты по статусу
 	var active, archive []Contest
 	for _, contest := range contests {
-		if contest.Status == "active" {
+		if contest.Status == "active" && contest.Started {
 			active = append(active, contest)
 		} else if contest.Status == "archive" {
 			archive = append(archive, contest)
@@ -757,18 +727,5 @@ func getShortStatusEmoji(verdict int) string {
 		return "🔨"
 	default:
 		return "⏳"
-	}
-}
-
-func getStatusText(verdict int) string {
-	switch verdict {
-	case 1:
-		return "Принято"
-	case 2:
-		return "Неверный"
-	case 5:
-		return "Компиляция"
-	default:
-		return "В процессе"
 	}
 }

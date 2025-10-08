@@ -316,27 +316,6 @@ func (a *APIClient) addKnownContests(contests []Contest) []Contest {
 	return contests
 }
 
-func (a *APIClient) isContestAccessible(contestID string) bool {
-	// Проверяем доступность через запрос задач контеста
-	endpoint := fmt.Sprintf("/getContestTasks?id=%s", contestID)
-
-	req, err := http.NewRequest("GET", a.baseURL+endpoint, nil)
-	if err != nil {
-		return false
-	}
-
-	req.Header.Set("Authorization", "Bearer "+a.config.SessionToken)
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := a.client.Do(req)
-	if err != nil {
-		return false
-	}
-	defer resp.Body.Close()
-
-	return resp.StatusCode == http.StatusOK
-}
-
 func (a *APIClient) getFallbackContests() []Contest {
 	return []Contest{
 		{
@@ -517,80 +496,6 @@ func (a *APIClient) GetSubmissions(limit int) ([]Submission, error) {
 	return a.getAllSubmissions(limit)
 }
 
-// Получить отправки для задачи во всех контестах
-func (a *APIClient) getSubmissionsByTaskAcrossContests(taskID string, limit int) ([]Submission, error) {
-	fmt.Printf("🌐 Получение списка контестов для поиска задачи %s...\n", taskID)
-
-	contests, err := a.GetContests()
-	if err != nil {
-		return nil, fmt.Errorf("не удалось получить список контестов: %w", err)
-	}
-
-	var allSubmissions []Submission
-
-	// Ограничиваем количество проверяемых контестов для производительности
-	maxContests := 10
-	if len(contests) > maxContests {
-		fmt.Printf("📊 Ограничиваем проверку до %d последних контестов\n", maxContests)
-		contests = contests[:maxContests]
-	}
-
-	for i, contest := range contests {
-		fmt.Printf("🔍 Проверяем контест %d/%d (ID: %s)...\n", i+1, len(contests), contest.ID)
-
-		// Проверяем существует ли задача в этом контесте
-		contestInfo, err := a.GetContestInfo(contest.ID)
-		if err != nil {
-			continue
-		}
-
-		// Ищем задачу с нужным ID
-		taskExists := false
-		for _, task := range contestInfo.Tasks {
-			if fmt.Sprintf("%d", task.ID) == taskID {
-				taskExists = true
-				break
-			}
-		}
-
-		if taskExists {
-			fmt.Printf("✅ Задача %s найдена в контесте %s\n", taskID, contest.ID)
-			taskSubmissions, err := a.tryGetSubmissions(fmt.Sprintf("/getMySubmissionsByTask?id=%s&contestid=%s", taskID, contest.ID), 0)
-			if err != nil {
-				fmt.Printf("⚠️  Ошибка получения отправок: %v\n", err)
-				continue
-			}
-
-			// Добавляем информацию о контесте к каждой отправке
-			for j := range taskSubmissions {
-				taskSubmissions[j].ProblemID, _ = strconv.Atoi(taskID)
-				taskSubmissions[j].ContestID = contest.ID
-				taskSubmissions[j].ContestName = contest.Name
-			}
-
-			allSubmissions = append(allSubmissions, taskSubmissions...)
-
-			// Если нашли достаточно отправок, можно остановиться
-			if limit > 0 && len(allSubmissions) >= limit {
-				break
-			}
-		}
-	}
-
-	// Сортируем по ID (более новые сначала)
-	sort.Slice(allSubmissions, func(i, j int) bool {
-		return allSubmissions[i].ID > allSubmissions[j].ID
-	})
-
-	// Применяем лимит
-	if limit > 0 && limit < len(allSubmissions) {
-		return allSubmissions[:limit], nil
-	}
-
-	return allSubmissions, nil
-}
-
-// Получить отправки для конкретного контеста
 // Получить отправки для конкретного контеста
 func (a *APIClient) getSubmissionsByContest(contestID string, limit int) ([]Submission, error) {
 	contestInfo, err := a.GetContestInfo(contestID)
@@ -699,10 +604,17 @@ func (a *APIClient) tryGetSubmissions(endpoint string, limit int) ([]Submission,
 		if resp.StatusCode == 404 {
 			return []Submission{}, nil
 		}
-		// Для 429 (Too Many Requests) просто возвращаем пустой список
+
 		if resp.StatusCode == 429 {
+			fmt.Printf("⚠️  Rate limit, ждем 1 секунду...\n")
+			time.Sleep(1 * time.Second)
 			return []Submission{}, fmt.Errorf("rate limit")
 		}
+
+		// Для 429 (Too Many Requests) просто возвращаем пустой список
+		// if resp.StatusCode == 429 {
+		// 	return []Submission{}, fmt.Errorf("rate limit")
+		// }
 		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 
