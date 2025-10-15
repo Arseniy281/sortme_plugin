@@ -183,4 +183,4 @@ $ sortme problems 0
 
 + Плагин успешно решает задачу интеграции среды разработки с образовательной платформой, автоматизируя рутинные операции и улучшая опыт обучения.
 
-### GitHub репозиторий: https://github.com/your-Arseniy281/sortme-plugin
+### GitHub репозиторий: https://github.com/Arseniy281/sortme_plugin
