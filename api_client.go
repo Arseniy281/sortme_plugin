@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -119,10 +121,477 @@ type Contest struct {
 	Started bool   `json:"started"`
 }
 
-type Problem struct {
-	ID    string `json:"id"`
-	Name  string `json:"name"`
-	Title string `json:"title"`
+// В методе getArchiveContestSubmissions уберем лишний вывод
+func (a *APIClient) getArchiveContestSubmissions(contestID string, contestInfo *ContestInfo, limit int) ([]Submission, error) {
+	insecureClient := &http.Client{
+		Timeout: 15 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+			},
+		},
+	}
+
+	// Пробуем разные endpoints для архивных контестов (тихо, без вывода)
+	endpoints := []string{
+		fmt.Sprintf("/getArchiveSubmissions?contest_id=%s", contestID),
+		fmt.Sprintf("/getMyArchiveSubmissions?contest_id=%s", contestID),
+		fmt.Sprintf("/archive/%s/submissions", contestID),
+	}
+
+	for _, endpoint := range endpoints {
+		url := "https://94.103.85.238" + endpoint
+
+		req, err := http.NewRequest("GET", url, nil)
+		if err != nil {
+			continue
+		}
+
+		req.Host = "api.sort-me.org"
+		req.Header.Set("Authorization", "Bearer "+a.config.SessionToken)
+		req.Header.Set("Accept", "application/json")
+
+		resp, err := insecureClient.Do(req)
+		if err != nil {
+			continue
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode == http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+
+			// Пробуем разные форматы ответа
+			foundSubmissions, err := a.parseArchiveSubmissions(body, contestInfo)
+			if err == nil && len(foundSubmissions) > 0 {
+				return foundSubmissions, nil
+			}
+		}
+	}
+
+	// Если специальные endpoints не работают, пробуем получить отправки через общий метод
+	return a.getSubmissionsViaTasks(contestID, contestInfo, limit)
+}
+
+// В методе getSubmissionsViaTasks упростим вывод
+func (a *APIClient) getSubmissionsViaTasks(contestID string, contestInfo *ContestInfo, limit int) ([]Submission, error) {
+	var allSubmissions []Submission
+
+	for i, task := range contestInfo.Tasks {
+		// Добавляем небольшую задержку между запросами
+		if i > 0 {
+			time.Sleep(100 * time.Millisecond)
+		}
+
+		endpoint := fmt.Sprintf("/getMySubmissionsByTask?id=%d", task.ID)
+		taskSubmissions, err := a.tryGetSubmissions(endpoint, 0)
+		if err != nil {
+			continue
+		}
+
+		// Добавляем информацию о задаче к каждой отправке
+		for j := range taskSubmissions {
+			taskSubmissions[j].ProblemID = task.ID
+			taskSubmissions[j].ProblemName = task.Name
+			taskSubmissions[j].ContestID = contestID
+			taskSubmissions[j].ContestName = contestInfo.Name
+		}
+
+		allSubmissions = append(allSubmissions, taskSubmissions...)
+	}
+
+	// Сортируем по ID (более новые сначала)
+	sort.Slice(allSubmissions, func(i, j int) bool {
+		return allSubmissions[i].ID > allSubmissions[j].ID
+	})
+
+	// Применяем лимит
+	if limit > 0 && limit < len(allSubmissions) {
+		return allSubmissions[:limit], nil
+	}
+
+	return allSubmissions, nil
+}
+
+// В методе tryGetSubmissions уберем лишний вывод
+func (a *APIClient) tryGetSubmissions(endpoint string, limit int) ([]Submission, error) {
+	client := &http.Client{
+		Timeout: 15 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+			},
+		},
+	}
+
+	baseURL := "https://94.103.85.238"
+	fullURL := baseURL + endpoint
+
+	req, err := http.NewRequest("GET", fullURL, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Host = "api.sort-me.org"
+	req.Header.Set("Authorization", "Bearer "+a.config.SessionToken)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		if resp.StatusCode == 404 {
+			return []Submission{}, nil
+		}
+		if resp.StatusCode == 429 {
+			time.Sleep(1 * time.Second)
+			return []Submission{}, fmt.Errorf("rate limit")
+		}
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+
+	var response struct {
+		Count       int          `json:"count"`
+		Submissions []Submission `json:"submissions"`
+	}
+
+	if err := json.Unmarshal(body, &response); err != nil {
+		return nil, err
+	}
+
+	// Сортируем по ID (более новые сначала)
+	sort.Slice(response.Submissions, func(i, j int) bool {
+		return response.Submissions[i].ID > response.Submissions[j].ID
+	})
+
+	if limit > 0 && limit < len(response.Submissions) {
+		return response.Submissions[:limit], nil
+	}
+
+	return response.Submissions, nil
+}
+
+// В методе GetContestSubmissions упростим вывод
+func (a *APIClient) GetContestSubmissions(contestID string, limit int) ([]Submission, error) {
+	if !a.IsAuthenticated() {
+		return nil, fmt.Errorf("not authenticated")
+	}
+
+	// Получаем информацию о контесте
+	contestInfo, err := a.GetContestInfo(contestID)
+	if err != nil {
+		return nil, fmt.Errorf("не удалось получить информацию о контесте: %w", err)
+	}
+
+	// Для архивных контестов используем специальный метод
+	if contestInfo.Status == "archive" {
+		return a.getArchiveContestSubmissions(contestID, contestInfo, limit)
+	}
+
+	var allSubmissions []Submission
+
+	// Для обычных контестов используем старый метод
+	for _, task := range contestInfo.Tasks {
+		taskSubmissions, err := a.tryGetSubmissions(fmt.Sprintf("/getMySubmissionsByTask?id=%d&contestid=%s", task.ID, contestID), 0)
+		if err != nil {
+			continue
+		}
+
+		// Добавляем информацию о задаче к каждой отправке
+		for j := range taskSubmissions {
+			taskSubmissions[j].ProblemID = task.ID
+			taskSubmissions[j].ProblemName = task.Name
+			taskSubmissions[j].ContestID = contestID
+			taskSubmissions[j].ContestName = contestInfo.Name
+		}
+
+		allSubmissions = append(allSubmissions, taskSubmissions...)
+	}
+
+	// Сортируем по ID (более новые сначала)
+	sort.Slice(allSubmissions, func(i, j int) bool {
+		return allSubmissions[i].ID > allSubmissions[j].ID
+	})
+
+	// Применяем лимит
+	if limit > 0 && limit < len(allSubmissions) {
+		return allSubmissions[:limit], nil
+	}
+
+	return allSubmissions, nil
+}
+
+// В методе parseArchiveSubmissions убираем неиспользуемую переменную
+func (a *APIClient) parseArchiveSubmissions(body []byte, contestInfo *ContestInfo) ([]Submission, error) {
+	// Убрали объявление resultSubmissions так как она не используется
+
+	// Формат 1: Прямой массив отправок
+	var directSubmissions []Submission
+	if err := json.Unmarshal(body, &directSubmissions); err == nil && len(directSubmissions) > 0 {
+		fmt.Printf("     📝 Формат: прямой массив отправок\n")
+		// Обогащаем данные информацией о контесте
+		for i := range directSubmissions {
+			directSubmissions[i].ContestID = fmt.Sprintf("%d", contestInfo.ID) // Конвертируем int в string
+			directSubmissions[i].ContestName = contestInfo.Name
+			// Находим имя задачи по ID
+			for _, task := range contestInfo.Tasks {
+				if task.ID == directSubmissions[i].ProblemID {
+					directSubmissions[i].ProblemName = task.Name
+					break
+				}
+			}
+		}
+		return directSubmissions, nil
+	}
+
+	// Формат 2: Объект с полем submissions
+	var withSubmissionsField struct {
+		Submissions []Submission `json:"submissions"`
+		Count       int          `json:"count"`
+	}
+	if err := json.Unmarshal(body, &withSubmissionsField); err == nil && withSubmissionsField.Submissions != nil {
+		fmt.Printf("     📝 Формат: объект с submissions\n")
+		for i := range withSubmissionsField.Submissions {
+			withSubmissionsField.Submissions[i].ContestID = fmt.Sprintf("%d", contestInfo.ID) // Конвертируем int в string
+			withSubmissionsField.Submissions[i].ContestName = contestInfo.Name
+			for _, task := range contestInfo.Tasks {
+				if task.ID == withSubmissionsField.Submissions[i].ProblemID {
+					withSubmissionsField.Submissions[i].ProblemName = task.Name
+					break
+				}
+			}
+		}
+		return withSubmissionsField.Submissions, nil
+	}
+
+	return nil, fmt.Errorf("неизвестный формат ответа")
+}
+
+func (a *APIClient) GetContests() ([]Contest, error) {
+	if !a.IsAuthenticated() {
+		return nil, fmt.Errorf("not authenticated")
+	}
+
+	fmt.Println("🔍 Поиск контестов через API...")
+
+	// Получаем архивные контесты
+	archiveContests, err := a.getArchiveContestsViaIP()
+	if err != nil {
+		return nil, fmt.Errorf("не удалось получить контесты: %v", err)
+	}
+
+	if len(archiveContests) == 0 {
+		return nil, fmt.Errorf("контесты не найдены")
+	}
+
+	fmt.Printf("✅ Найдено контестов: %d\n", len(archiveContests))
+	return archiveContests, nil
+}
+
+func (a *APIClient) getArchiveContestsViaIP() ([]Contest, error) {
+	insecureClient := &http.Client{
+		Timeout: 15 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+			},
+		},
+	}
+
+	url := "https://94.103.85.238/getArchivePreviews"
+	fmt.Printf("  📡 Запрос архивных контестов...\n")
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Host = "api.sort-me.org"
+	req.Header.Set("Authorization", "Bearer "+a.config.SessionToken)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := insecureClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+
+	var response struct {
+		Count int `json:"count"`
+		Items []struct {
+			ID   int    `json:"id"`
+			Name string `json:"name"`
+		} `json:"items"`
+	}
+
+	if err := json.Unmarshal(body, &response); err != nil {
+		return nil, err
+	}
+
+	var contests []Contest
+	for _, item := range response.Items {
+		contests = append(contests, Contest{
+			ID:     fmt.Sprintf("%d", item.ID),
+			Name:   item.Name,
+			Status: "archive",
+		})
+	}
+
+	return contests, nil
+}
+
+func (a *APIClient) GetContestInfo(contestID string) (*ContestInfo, error) {
+	if !a.IsAuthenticated() {
+		return nil, fmt.Errorf("not authenticated")
+	}
+
+	fmt.Printf("📚 Получение информации о контесте %s...\n", contestID)
+
+	// Конвертируем ID в число
+	contestIDInt, err := strconv.Atoi(contestID)
+	if err != nil {
+		return nil, fmt.Errorf("неверный ID контеста: %s", contestID)
+	}
+
+	// Пробуем разные методы для получения информации о контесте
+	return a.getContestInfoUniversal(contestIDInt)
+}
+
+func (a *APIClient) getContestInfoUniversal(contestID int) (*ContestInfo, error) {
+	// Метод 1: Стандартный endpoint для обычных контестов
+	if contestInfo, err := a.tryStandardEndpoint(contestID); err == nil {
+		return contestInfo, nil
+	}
+
+	// Метод 2: Archive endpoint для архивных контестов
+	if contestInfo, err := a.tryArchiveEndpoint(contestID); err == nil {
+		return contestInfo, nil
+	}
+
+	return nil, fmt.Errorf("контест %d недоступен", contestID)
+}
+
+func (a *APIClient) tryStandardEndpoint(contestID int) (*ContestInfo, error) {
+	insecureClient := &http.Client{
+		Timeout: 15 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+			},
+		},
+	}
+
+	endpoint := fmt.Sprintf("/getContestTasks?id=%d", contestID)
+	url := "https://94.103.85.238" + endpoint
+
+	fmt.Printf("  📡 Стандартный endpoint: %s\n", endpoint)
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Host = "api.sort-me.org"
+	req.Header.Set("Authorization", "Bearer "+a.config.SessionToken)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := insecureClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+
+	var contestInfo ContestInfo
+	if err := json.Unmarshal(body, &contestInfo); err != nil {
+		return nil, err
+	}
+
+	fmt.Printf("  ✅ Контест: %s, задач: %d\n", contestInfo.Name, len(contestInfo.Tasks))
+	return &contestInfo, nil
+}
+
+func (a *APIClient) tryArchiveEndpoint(contestID int) (*ContestInfo, error) {
+	insecureClient := &http.Client{
+		Timeout: 15 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+			},
+		},
+	}
+
+	endpoint := fmt.Sprintf("/getArchiveById?id=%d", contestID)
+	url := "https://94.103.85.238" + endpoint
+
+	fmt.Printf("  📡 Archive endpoint: %s\n", endpoint)
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Host = "api.sort-me.org"
+	req.Header.Set("Authorization", "Bearer "+a.config.SessionToken)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := insecureClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+
+	// Парсим архивные данные
+	var archiveData struct {
+		ID      int    `json:"id"`
+		Name    string `json:"name"`
+		Seasons []struct {
+			Name          string `json:"name"`
+			SourceContest int    `json:"source_contest"`
+			Tasks         []Task `json:"tasks"`
+		} `json:"seasons"`
+	}
+
+	if err := json.Unmarshal(body, &archiveData); err != nil {
+		return nil, fmt.Errorf("ошибка парсинга: %w", err)
+	}
+
+	// Собираем все задачи из всех seasons
+	var allTasks []Task
+	for _, season := range archiveData.Seasons {
+		allTasks = append(allTasks, season.Tasks...)
+	}
+
+	fmt.Printf("  ✅ Архивный контест: %s, seasons: %d, задач: %d\n",
+		archiveData.Name, len(archiveData.Seasons), len(allTasks))
+
+	return &ContestInfo{
+		ID:     archiveData.ID,
+		Name:   archiveData.Name,
+		Status: "archive",
+		Tasks:  allTasks,
+	}, nil
 }
 
 func NewAPIClient(config *Config) *APIClient {
@@ -134,6 +603,21 @@ func NewAPIClient(config *Config) *APIClient {
 		// ПРАВИЛЬНЫЙ BASE URL - API сервер
 		baseURL: "https://api.sort-me.org",
 	}
+}
+
+func cleanSubmissionID(submissionID string) string {
+	// Если ID приходит в формате JSON, извлекаем числовое значение
+	if strings.HasPrefix(submissionID, "{") && strings.Contains(submissionID, "id") {
+		var response struct {
+			ID interface{} `json:"id"`
+		}
+		if err := json.Unmarshal([]byte(submissionID), &response); err == nil {
+			if response.ID != nil {
+				return fmt.Sprintf("%v", response.ID)
+			}
+		}
+	}
+	return submissionID
 }
 
 func (a *APIClient) SubmitSolution(contestID, problemID, language, sourceCode string) (*SubmitResponse, error) {
@@ -165,21 +649,38 @@ func (a *APIClient) SubmitSolution(contestID, problemID, language, sourceCode st
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	fmt.Printf("📡 Отправка запроса на %s/submit\n", a.baseURL)
+	fmt.Printf("📡 Отправка решения...\n")
 	fmt.Printf("📦 Данные: contest_id=%d, task_id=%d, lang=%s\n", contestIDInt, problemIDInt, language)
 
-	req, err := http.NewRequest("POST", a.baseURL+"/submit", bytes.NewBuffer(jsonData))
+	// Используем прямое IP подключение для отправки
+	return a.submitViaIP(jsonData)
+}
+
+func (a *APIClient) submitViaIP(jsonData []byte) (*SubmitResponse, error) {
+	insecureClient := &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+			},
+		},
+	}
+
+	url := "https://94.103.85.238/submit"
+	fmt.Printf("🌐 Отправка через IP: %s\n", url)
+
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
-	// Headers из найденного запроса
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+a.config.SessionToken)
+	req.Host = "api.sort-me.org"
 
 	fmt.Printf("🔑 Используется токен: %s\n", maskToken(a.config.SessionToken))
 
-	resp, err := a.client.Do(req)
+	resp, err := insecureClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("network error: %w", err)
 	}
@@ -188,16 +689,29 @@ func (a *APIClient) SubmitSolution(contestID, problemID, language, sourceCode st
 	body, _ := io.ReadAll(resp.Body)
 
 	fmt.Printf("📥 Ответ сервера: Status %d\n", resp.StatusCode)
+	fmt.Printf("📦 Тело ответа: %s\n", string(body)) // Добавьте это для отладки
 
-	// Успешные статусы: 200 OK, 201 Created
 	if resp.StatusCode >= 400 {
 		return nil, fmt.Errorf("API вернул ошибку %d: %s", resp.StatusCode, string(body))
 	}
 
 	var apiResponse SubmitResponse
 	if err := json.Unmarshal(body, &apiResponse); err != nil {
-		// Если не можем распарсить JSON, но статус успешный - создаем базовый ответ
+		// Если не можем распарсить JSON, но статус успешный - пробуем извлечь ID из ответа
 		if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated {
+			// Пробуем распарсить как объект с полем id
+			var responseObj map[string]interface{}
+			if err := json.Unmarshal(body, &responseObj); err == nil {
+				if id, exists := responseObj["id"]; exists {
+					// Конвертируем ID в строку независимо от его типа
+					apiResponse.ID = fmt.Sprintf("%v", id)
+					apiResponse.Status = "submitted"
+					apiResponse.Message = "Решение успешно отправлено"
+					return &apiResponse, nil
+				}
+			}
+
+			// Если не удалось распарсить как объект, возвращаем как есть
 			return &SubmitResponse{
 				ID:      string(body),
 				Status:  "submitted",
@@ -207,12 +721,23 @@ func (a *APIClient) SubmitSolution(contestID, problemID, language, sourceCode st
 		return nil, fmt.Errorf("failed to parse response: %w", err)
 	}
 
+	// Убедимся, что ID в правильном формате
+	if apiResponse.ID == "" {
+		// Если ID пустой в JSON ответе, но есть в другом поле
+		var responseObj map[string]interface{}
+		if err := json.Unmarshal(body, &responseObj); err == nil {
+			if id, exists := responseObj["id"]; exists {
+				apiResponse.ID = fmt.Sprintf("%v", id)
+			}
+		}
+	}
+
 	return &apiResponse, nil
 }
 
 func (a *APIClient) getStatusViaWebSocket(submissionID string) (*SubmissionStatus, error) {
-	// Создаем WebSocket URL
-	wsURL := "wss://api.sort-me.org/ws/submission?id=" + submissionID + "&token=" + a.config.SessionToken
+	// Создаем WebSocket URL с IP
+	wsURL := "wss://94.103.85.238/ws/submission?id=" + submissionID + "&token=" + a.config.SessionToken
 
 	fmt.Printf("🔗 WebSocket URL: wss://api.sort-me.org/ws/submission?id=%s&token=%s\n",
 		submissionID, maskToken(a.config.SessionToken))
@@ -220,6 +745,9 @@ func (a *APIClient) getStatusViaWebSocket(submissionID string) (*SubmissionStatu
 	// Создаем соединение
 	dialer := websocket.Dialer{
 		HandshakeTimeout: 10 * time.Second,
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true,
+		},
 	}
 
 	conn, _, err := dialer.Dial(wsURL, nil)
@@ -270,6 +798,9 @@ func (a *APIClient) getStatusViaWebSocket(submissionID string) (*SubmissionStatu
 			if status.Time != "" {
 				fmt.Printf(" ⏱️ %s", status.Time)
 			}
+			if status.Memory != "" {
+				fmt.Printf(" 💾 %s", status.Memory)
+			}
 			fmt.Println()
 
 			// Проверяем финальный ли это статус
@@ -281,55 +812,6 @@ func (a *APIClient) getStatusViaWebSocket(submissionID string) (*SubmissionStatu
 			// Обновляем таймаут для следующего чтения
 			conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 		}
-	}
-}
-
-func (a *APIClient) addKnownContests(contests []Contest) []Contest {
-	knownContests := map[string]Contest{
-		"456": {
-			ID:      "456",
-			Name:    "Лабораторная АиСД ИТМО №2 (25/26)",
-			Status:  "active",
-			Started: true,
-		},
-		"457": {
-			ID:      "457",
-			Name:    "Лабораторная АиСД ИТМО №3 (25/26)",
-			Status:  "active",
-			Started: true,
-		},
-	}
-
-	// Проверяем какие известные контесты уже есть в списке
-	existingIDs := make(map[string]bool)
-	for _, contest := range contests {
-		existingIDs[contest.ID] = true
-	}
-
-	// Добавляем отсутствующие известные контесты
-	for id, contest := range knownContests {
-		if !existingIDs[id] {
-			contests = append(contests, contest)
-		}
-	}
-
-	return contests
-}
-
-func (a *APIClient) getFallbackContests() []Contest {
-	return []Contest{
-		{
-			ID:      "456",
-			Name:    "Лабораторная АиСД ИТМО №2 (25/26)",
-			Status:  "active",
-			Started: true,
-		},
-		{
-			ID:      "457",
-			Name:    "Лабораторная АиСД ИТМО №3 (25/26)",
-			Status:  "active",
-			Started: true,
-		},
 	}
 }
 
@@ -438,54 +920,6 @@ func (a *APIClient) isFinalStatus(status string) bool {
 	return false
 }
 
-func (a *APIClient) tryRESTStatus(submissionID string) (*SubmissionStatus, error) {
-	endpoints := []string{
-		"/submission/" + submissionID,
-		"/submissions/" + submissionID,
-		"/api/submission/" + submissionID,
-		"/api/submissions/" + submissionID,
-	}
-
-	var lastError error
-	for _, endpoint := range endpoints {
-		status, err := a.tryGetStatus(endpoint)
-		if err == nil {
-			return status, nil
-		}
-		lastError = err
-	}
-	return nil, lastError
-}
-
-func (a *APIClient) tryGetStatus(endpoint string) (*SubmissionStatus, error) {
-	req, err := http.NewRequest("GET", a.baseURL+endpoint, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	req.Header.Set("Authorization", "Bearer "+a.config.SessionToken)
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := a.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("status %d", resp.StatusCode)
-	}
-
-	body, _ := io.ReadAll(resp.Body)
-	var status SubmissionStatus
-	if err := json.Unmarshal(body, &status); err != nil {
-		return nil, err
-	}
-
-	return &status, nil
-}
-
-// Методы для списка отправок
 // Методы для списка отправок
 func (a *APIClient) GetSubmissions(limit int) ([]Submission, error) {
 	if !a.IsAuthenticated() {
@@ -496,49 +930,76 @@ func (a *APIClient) GetSubmissions(limit int) ([]Submission, error) {
 	return a.getAllSubmissions(limit)
 }
 
-// Получить отправки для конкретного контеста
-func (a *APIClient) getSubmissionsByContest(contestID string, limit int) ([]Submission, error) {
-	contestInfo, err := a.GetContestInfo(contestID)
+// Быстрый метод для получения последних отправок
+func (a *APIClient) GetRecentSubmissions(limit int) ([]Submission, error) {
+	if !a.IsAuthenticated() {
+		return nil, fmt.Errorf("not authenticated")
+	}
+
+	fmt.Printf("🔍 Поиск %d последних отправок...\n", limit)
+
+	// Пробуем получить отправки только из доступных контестов
+	contests, err := a.GetContests()
 	if err != nil {
 		return nil, err
 	}
 
+	// Берем только первые 2 контеста для скорости
+	if len(contests) > 2 {
+		contests = contests[:2]
+	}
+
 	var allSubmissions []Submission
 
-	fmt.Printf("📚 Задачи контеста (%d): ", len(contestInfo.Tasks))
+	for _, contest := range contests {
+		fmt.Printf("📚 Контест: %s... ", contest.Name)
 
-	// Последовательно получаем отправки для каждой задачи
-	for i, task := range contestInfo.Tasks {
-		// Увеличиваем задержку чтобы избежать rate limiting
-		if i > 0 {
-			time.Sleep(200 * time.Millisecond) // Увеличили до 200мс
-		}
-
-		taskSubmissions, err := a.tryGetSubmissions(fmt.Sprintf("/getMySubmissionsByTask?id=%d&contestid=%s", task.ID, contestID), 0)
+		// Получаем только первые 3 задачи контеста
+		contestInfo, err := a.GetContestInfo(contest.ID)
 		if err != nil {
-			fmt.Printf("❌") // Просто крестик без текста
+			fmt.Printf("❌\n")
 			continue
 		}
 
-		fmt.Printf("✅") // Галочка для успешной загрузки
-
-		// Добавляем информацию о задаче к каждой отправке
-		for j := range taskSubmissions {
-			taskSubmissions[j].ProblemID = task.ID
-			taskSubmissions[j].ProblemName = task.Name
-			taskSubmissions[j].ContestID = contestID
-			taskSubmissions[j].ContestName = contestInfo.Name
+		if len(contestInfo.Tasks) == 0 {
+			fmt.Printf("📭\n")
+			continue
 		}
 
-		allSubmissions = append(allSubmissions, taskSubmissions...)
+		// Ограничиваем количество задач
+		maxTasks := 3
+		if len(contestInfo.Tasks) > maxTasks {
+			contestInfo.Tasks = contestInfo.Tasks[:maxTasks]
+		}
+
+		var contestSubmissions []Submission
+
+		for _, task := range contestInfo.Tasks {
+			// Получаем только последние 2 отправки для каждой задачи
+			submissions, err := a.tryGetSubmissions(fmt.Sprintf("/getMySubmissionsByTask?id=%d&contestid=%s", task.ID, contest.ID), 2)
+			if err != nil {
+				continue
+			}
+
+			// Добавляем информацию о задаче
+			for i := range submissions {
+				submissions[i].ProblemID = task.ID
+				submissions[i].ProblemName = task.Name
+				submissions[i].ContestID = contest.ID
+				submissions[i].ContestName = contestInfo.Name
+			}
+
+			contestSubmissions = append(contestSubmissions, submissions...)
+		}
+
+		fmt.Printf("✅ %d отправок\n", len(contestSubmissions))
+		allSubmissions = append(allSubmissions, contestSubmissions...)
 	}
 
 	// Сортируем по ID (более новые сначала)
 	sort.Slice(allSubmissions, func(i, j int) bool {
 		return allSubmissions[i].ID > allSubmissions[j].ID
 	})
-
-	fmt.Printf(" | %d отправок\n", len(allSubmissions))
 
 	// Применяем лимит
 	if limit > 0 && limit < len(allSubmissions) {
@@ -548,9 +1009,9 @@ func (a *APIClient) getSubmissionsByContest(contestID string, limit int) ([]Subm
 	return allSubmissions, nil
 }
 
-// Получить все отправки (через известные контесты)
+// Получить все отправки (оптимизированная версия)
 func (a *APIClient) getAllSubmissions(limit int) ([]Submission, error) {
-	// Получаем только активные контесты
+	// Получаем реальные контесты через API
 	contests, err := a.GetContests()
 	if err != nil {
 		return nil, fmt.Errorf("не удалось получить список контестов: %w", err)
@@ -558,15 +1019,64 @@ func (a *APIClient) getAllSubmissions(limit int) ([]Submission, error) {
 
 	var allSubmissions []Submission
 
-	for i, contest := range contests {
-		fmt.Printf("🔍 Контест %d/%d: %s\n", i+1, len(contests), contest.Name)
+	fmt.Printf("🔍 Поиск отправок в %d контестах...\n", len(contests))
 
-		contestSubmissions, err := a.getSubmissionsByContest(contest.ID, 0)
+	// Ограничиваем количество проверяемых контестов для скорости
+	maxContests := 3
+	if len(contests) > maxContests {
+		fmt.Printf("⚠️  Ограничиваем до %d контестов для скорости\n", maxContests)
+		contests = contests[:maxContests]
+	}
+
+	for i, contest := range contests {
+		fmt.Printf("📚 Контест %d/%d: %s\n", i+1, len(contests), contest.Name)
+
+		// Получаем информацию о контесте
+		contestInfo, err := a.GetContestInfo(contest.ID)
 		if err != nil {
+			fmt.Printf("   ⚠️  Не удалось получить задачи: %v\n", err)
 			continue
 		}
 
+		fmt.Printf("📚 Задачи контеста (%d): ", len(contestInfo.Tasks))
+
+		var contestSubmissions []Submission
+
+		// Ограничиваем количество проверяемых задач для скорости
+		maxTasks := 5
+		tasksToCheck := contestInfo.Tasks
+		if len(tasksToCheck) > maxTasks {
+			tasksToCheck = tasksToCheck[:maxTasks]
+		}
+
+		// Последовательно получаем отправки для каждой задачи
+		for j, task := range tasksToCheck {
+			// Увеличиваем задержку чтобы избежать rate limiting
+			if j > 0 {
+				time.Sleep(500 * time.Millisecond) // Увеличили до 500мс
+			}
+
+			taskSubmissions, err := a.tryGetSubmissions(fmt.Sprintf("/getMySubmissionsByTask?id=%d&contestid=%s", task.ID, contest.ID), 5) // Ограничиваем 5 отправок на задачу
+			if err != nil {
+				fmt.Printf("❌") // Просто крестик без текста
+				continue
+			}
+
+			fmt.Printf("✅") // Галочка для успешной загрузки
+
+			// Добавляем информацию о задаче к каждой отправке
+			for k := range taskSubmissions {
+				taskSubmissions[k].ProblemID = task.ID
+				taskSubmissions[k].ProblemName = task.Name
+				taskSubmissions[k].ContestID = contest.ID
+				taskSubmissions[k].ContestName = contestInfo.Name
+			}
+
+			contestSubmissions = append(contestSubmissions, taskSubmissions...)
+		}
+
 		allSubmissions = append(allSubmissions, contestSubmissions...)
+		fmt.Printf(" | %d отправок\n", len(contestSubmissions))
 	}
 
 	// Сортируем по ID (более новые сначала)
@@ -582,185 +1092,6 @@ func (a *APIClient) getAllSubmissions(limit int) ([]Submission, error) {
 	}
 
 	return allSubmissions, nil
-}
-
-func (a *APIClient) tryGetSubmissions(endpoint string, limit int) ([]Submission, error) {
-	req, err := http.NewRequest("GET", a.baseURL+endpoint, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	req.Header.Set("Authorization", "Bearer "+a.config.SessionToken)
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := a.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		// Для 404 возвращаем пустой список
-		if resp.StatusCode == 404 {
-			return []Submission{}, nil
-		}
-
-		if resp.StatusCode == 429 {
-			fmt.Printf("⚠️  Rate limit, ждем 1 секунду...\n")
-			time.Sleep(1 * time.Second)
-			return []Submission{}, fmt.Errorf("rate limit")
-		}
-
-		// Для 429 (Too Many Requests) просто возвращаем пустой список
-		// if resp.StatusCode == 429 {
-		// 	return []Submission{}, fmt.Errorf("rate limit")
-		// }
-		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
-	}
-
-	body, _ := io.ReadAll(resp.Body)
-
-	// Парсим ответ в правильном формате
-	var response struct {
-		Count       int          `json:"count"`
-		Submissions []Submission `json:"submissions"`
-	}
-
-	if err := json.Unmarshal(body, &response); err != nil {
-		return nil, err
-	}
-
-	// Сортируем по ID (более новые сначала)
-	sort.Slice(response.Submissions, func(i, j int) bool {
-		return response.Submissions[i].ID > response.Submissions[j].ID
-	})
-
-	// Ограничиваем количество результатов
-	if limit > 0 && limit < len(response.Submissions) {
-		return response.Submissions[:limit], nil
-	}
-
-	return response.Submissions, nil
-}
-
-func (a *APIClient) GetContestInfo(contestID string) (*ContestInfo, error) {
-	if !a.IsAuthenticated() {
-		return nil, fmt.Errorf("not authenticated")
-	}
-
-	// Используем найденный endpoint
-	endpoint := "/getContestTasks?id=" + contestID
-
-	fmt.Printf("🔍 Используем endpoint: %s\n", endpoint)
-
-	return a.tryGetContestInfo(endpoint)
-}
-
-func (a *APIClient) tryGetContestInfo(endpoint string) (*ContestInfo, error) {
-	req, err := http.NewRequest("GET", a.baseURL+endpoint, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	req.Header.Set("Authorization", "Bearer "+a.config.SessionToken)
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := a.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("status %d", resp.StatusCode)
-	}
-
-	body, _ := io.ReadAll(resp.Body)
-
-	var contestInfo ContestInfo
-	if err := json.Unmarshal(body, &contestInfo); err != nil {
-		return nil, err
-	}
-
-	fmt.Printf("✅ Получена информация о контесте: %s\n", contestInfo.Name)
-	return &contestInfo, nil
-}
-
-func (a *APIClient) GetContests() ([]Contest, error) {
-	if !a.IsAuthenticated() {
-		return nil, fmt.Errorf("not authenticated")
-	}
-
-	// Используем только endpoint для предстоящих контестов
-	endpoint := "/getUpcomingContests"
-
-	req, err := http.NewRequest("GET", a.baseURL+endpoint, nil)
-	if err != nil {
-		return a.getFallbackContests(), nil
-	}
-
-	req.Header.Set("Authorization", "Bearer "+a.config.SessionToken)
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := a.client.Do(req)
-	if err != nil {
-		return a.getFallbackContests(), nil
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return a.getFallbackContests(), nil
-	}
-
-	body, _ := io.ReadAll(resp.Body)
-
-	// Парсим ответ
-	var upcomingContests []struct {
-		ID                 int    `json:"id"`
-		Name               string `json:"name"`
-		Starts             int64  `json:"starts"`
-		Ends               int64  `json:"ends"`
-		OrgName            string `json:"org_name"`
-		Running            bool   `json:"running"`
-		RegistrationOpened bool   `json:"registration_opened"`
-		Ended              bool   `json:"ended"`
-	}
-
-	var contests []Contest
-	if err := json.Unmarshal(body, &upcomingContests); err == nil {
-		for _, uc := range upcomingContests {
-			status := "upcoming"
-			if uc.Running {
-				status = "active"
-			} else if uc.Ended {
-				status = "ended"
-			}
-
-			contests = append(contests, Contest{
-				ID:      fmt.Sprintf("%d", uc.ID),
-				Name:    uc.Name,
-				Status:  status,
-				Started: uc.Running,
-			})
-		}
-	}
-
-	// Добавляем известные контесты в любом случае
-	contests = a.addKnownContests(contests)
-
-	// Фильтруем только активные контесты
-	var activeContests []Contest
-	for _, contest := range contests {
-		if contest.Status == "active" && contest.Started {
-			activeContests = append(activeContests, contest)
-		}
-	}
-
-	if len(activeContests) == 0 {
-		return a.getFallbackContests(), nil
-	}
-
-	return activeContests, nil
 }
 
 func (a *APIClient) IsAuthenticated() bool {

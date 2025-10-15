@@ -9,11 +9,12 @@ import (
 )
 
 type Config struct {
-	TelegramToken string `mapstructure:"telegram_token"`
-	SessionToken  string `mapstructure:"session_token"`
-	UserID        string `mapstructure:"user_id"`
-	APIBaseURL    string `mapstructure:"api_base_url"`
-	Username      string `mapstructure:"username"`
+	TelegramToken  string `mapstructure:"telegram_token"`
+	SessionToken   string `mapstructure:"session_token"`
+	UserID         string `mapstructure:"user_id"`
+	APIBaseURL     string `mapstructure:"api_base_url"`
+	Username       string `mapstructure:"username"`
+	CurrentContest string `mapstructure:"current_contest"` // Новое поле
 }
 
 func getConfigPath() string {
