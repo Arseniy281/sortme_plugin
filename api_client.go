@@ -113,12 +113,11 @@ type Task struct {
 	ID   int    `json:"id"`
 	Name string `json:"name"`
 }
-
 type Contest struct {
 	ID      string `json:"id"`
 	Name    string `json:"name"`
-	Status  string `json:"status"`
-	Started bool   `json:"started"`
+	Status  string `json:"status"`  // active, upcoming, archive
+	Started bool   `json:"started"` // Добавляем это поле
 }
 
 // В методе getArchiveContestSubmissions уберем лишний вывод
@@ -212,7 +211,7 @@ func (a *APIClient) getSubmissionsViaTasks(contestID string, contestInfo *Contes
 	return allSubmissions, nil
 }
 
-// В методе tryGetSubmissions уберем лишний вывод
+// В методе tryGetSubmissions убедитесь что он получает все отправки
 func (a *APIClient) tryGetSubmissions(endpoint string, limit int) ([]Submission, error) {
 	client := &http.Client{
 		Timeout: 15 * time.Second,
@@ -268,7 +267,12 @@ func (a *APIClient) tryGetSubmissions(endpoint string, limit int) ([]Submission,
 		return response.Submissions[i].ID > response.Submissions[j].ID
 	})
 
-	if limit > 0 && limit < len(response.Submissions) {
+	// Если limit не указан, возвращаем все отправки
+	if limit <= 0 {
+		return response.Submissions, nil
+	}
+
+	if limit < len(response.Submissions) {
 		return response.Submissions[:limit], nil
 	}
 
@@ -371,27 +375,196 @@ func (a *APIClient) parseArchiveSubmissions(body []byte, contestInfo *ContestInf
 	return nil, fmt.Errorf("неизвестный формат ответа")
 }
 
+// ФИНАЛЬНАЯ РЕАЛИЗАЦИЯ GetContests
 func (a *APIClient) GetContests() ([]Contest, error) {
 	if !a.IsAuthenticated() {
 		return nil, fmt.Errorf("not authenticated")
 	}
 
-	fmt.Println("🔍 Поиск контестов через API...")
+	fmt.Println("🏆 Получение контестов...")
 
-	// Получаем архивные контесты
-	archiveContests, err := a.getArchiveContestsViaIP()
+	var allContests []Contest
+
+	// 1. АКТИВНЫЕ И ПРЕДСТОЯЩИЕ КОНТЕСТЫ
+	activeContests, err := a.getUpcomingContests()
 	if err != nil {
-		return nil, fmt.Errorf("не удалось получить контесты: %v", err)
+		fmt.Printf("⚠️ Не удалось получить активные контесты: %v\n", err)
+	} else {
+		allContests = append(allContests, activeContests...)
+		fmt.Printf("🎯 Активные/предстоящие контесты: %d\n", len(activeContests))
 	}
 
-	if len(archiveContests) == 0 {
+	// 2. АРХИВНЫЕ КОНТЕСТЫ
+	archiveContests, err := a.getArchiveContestsViaIP()
+	if err != nil {
+		fmt.Printf("⚠️ Не удалось получить архивные контесты: %v\n", err)
+	} else {
+		allContests = append(allContests, archiveContests...)
+		fmt.Printf("📚 Архивные контесты: %d\n", len(archiveContests))
+	}
+
+	if len(allContests) == 0 {
 		return nil, fmt.Errorf("контесты не найдены")
 	}
 
-	fmt.Printf("✅ Найдено контестов: %d\n", len(archiveContests))
-	return archiveContests, nil
+	// Обработка результатов
+	allContests = a.removeDuplicateContests(allContests)
+	allContests = a.sortContestsByStatus(allContests)
+
+	// Статистика
+	activeCount, archiveCount, upcomingCount := a.countContestsByDetailedStatus(allContests)
+
+	fmt.Printf("✅ Итого: %d контестов\n", len(allContests))
+	fmt.Printf("📊 Активных: %d, Предстоящих: %d, Архивных: %d\n",
+		activeCount, upcomingCount, archiveCount)
+
+	return allContests, nil
 }
 
+// Метод для получения активных/предстоящих контестов
+func (a *APIClient) getUpcomingContests() ([]Contest, error) {
+	insecureClient := &http.Client{
+		Timeout: 15 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+			},
+		},
+	}
+
+	url := "https://94.103.85.238/getUpcomingContests"
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Host = "api.sort-me.org"
+	req.Header.Set("Authorization", "Bearer "+a.config.SessionToken)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := insecureClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+
+	var upcomingContests []UpcomingContest
+	if err := json.Unmarshal(body, &upcomingContests); err != nil {
+		return nil, err
+	}
+
+	return a.convertUpcomingToContests(upcomingContests), nil
+}
+
+// Структура для предстоящих контестов
+type UpcomingContest struct {
+	ID     int    `json:"id"`
+	Name   string `json:"name"`
+	Starts int64  `json:"starts"`
+	Ends   int64  `json:"ends"`
+}
+
+// Конвертация в общую структуру Contest
+// Конвертация в общую структуру Contest
+func (a *APIClient) convertUpcomingToContests(upcoming []UpcomingContest) []Contest {
+	var contests []Contest
+	currentTime := time.Now().Unix()
+
+	for _, uc := range upcoming {
+		status := "active"
+		started := true // по умолчанию считаем что начался
+
+		if uc.Starts > currentTime {
+			status = "upcoming"
+			started = false // еще не начался
+		} else if uc.Ends < currentTime {
+			status = "archive"
+		}
+
+		contests = append(contests, Contest{
+			ID:      fmt.Sprintf("%d", uc.ID),
+			Name:    uc.Name,
+			Status:  status,
+			Started: started,
+		})
+
+		timeStatus := "активный"
+		if status == "upcoming" {
+			timeStatus = "предстоящий"
+		} else if status == "archive" {
+			timeStatus = "архивный"
+		}
+
+		fmt.Printf("   🎯 %s: %s (%s)\n", uc.Name, fmt.Sprintf("%d", uc.ID), timeStatus)
+	}
+
+	return contests
+}
+
+// ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ
+
+// Удаление дубликатов контестов
+func (a *APIClient) removeDuplicateContests(contests []Contest) []Contest {
+	seen := make(map[string]bool)
+	var result []Contest
+
+	for _, contest := range contests {
+		if !seen[contest.ID] {
+			seen[contest.ID] = true
+			result = append(result, contest)
+		}
+	}
+
+	return result
+}
+
+// Сортировка контестов по статусу (активные -> предстоящие -> архивные)
+func (a *APIClient) sortContestsByStatus(contests []Contest) []Contest {
+	var active, upcoming, archive []Contest
+
+	for _, contest := range contests {
+		switch contest.Status {
+		case "active":
+			active = append(active, contest)
+		case "upcoming":
+			upcoming = append(upcoming, contest)
+		case "archive":
+			archive = append(archive, contest)
+		}
+	}
+
+	// Собираем в правильном порядке
+	var result []Contest
+	result = append(result, active...)
+	result = append(result, upcoming...)
+	result = append(result, archive...)
+
+	return result
+}
+
+// Подсчет контестов по статусам
+func (a *APIClient) countContestsByDetailedStatus(contests []Contest) (active, archive, upcoming int) {
+	for _, contest := range contests {
+		switch contest.Status {
+		case "active":
+			active++
+		case "archive":
+			archive++
+		case "upcoming":
+			upcoming++
+		}
+	}
+	return
+}
+
+// Метод для получения архивных контестов (должен уже быть)
+// Метод для получения архивных контестов
 func (a *APIClient) getArchiveContestsViaIP() ([]Contest, error) {
 	insecureClient := &http.Client{
 		Timeout: 15 * time.Second,
@@ -403,8 +576,6 @@ func (a *APIClient) getArchiveContestsViaIP() ([]Contest, error) {
 	}
 
 	url := "https://94.103.85.238/getArchivePreviews"
-	fmt.Printf("  📡 Запрос архивных контестов...\n")
-
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return nil, err
@@ -441,9 +612,10 @@ func (a *APIClient) getArchiveContestsViaIP() ([]Contest, error) {
 	var contests []Contest
 	for _, item := range response.Items {
 		contests = append(contests, Contest{
-			ID:     fmt.Sprintf("%d", item.ID),
-			Name:   item.Name,
-			Status: "archive",
+			ID:      fmt.Sprintf("%d", item.ID),
+			Name:    item.Name,
+			Status:  "archive",
+			Started: true, // архивные контесты уже начались
 		})
 	}
 

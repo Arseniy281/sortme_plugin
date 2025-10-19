@@ -84,44 +84,62 @@ func (v *VSCodeExtension) handleContests() {
 	}
 
 	// Группируем контесты по статусу
-	var active, archive []Contest
+	var active, archive, upcoming []Contest
 	for _, contest := range contests {
-		if contest.Status == "active" && contest.Started {
+		switch contest.Status {
+		case "active":
 			active = append(active, contest)
-		} else if contest.Status == "archive" {
+		case "archive":
 			archive = append(archive, contest)
+		case "upcoming":
+			upcoming = append(upcoming, contest)
 		}
 	}
 
-	// Сначала показываем архивные
-	if len(archive) > 0 {
-		fmt.Printf("\n📚 Архивные контесты (%d):\n", len(archive))
-
-		for i, contest := range archive {
-			// Ограничиваем вывод до 8 контестов
-			if i >= 8 {
-				fmt.Printf("   ... и еще %d архивных контестов\n", len(archive)-8)
+	// Сначала показываем предстоящие контесты
+	if len(upcoming) > 0 {
+		fmt.Printf("\n📅 Предстоящие контесты (%d):\n", len(upcoming))
+		for i, contest := range upcoming {
+			if i >= 5 {
+				fmt.Printf("   ... и еще %d предстоящих контестов\n", len(upcoming)-5)
 				break
 			}
-
 			name := contest.Name
 			if len(name) > 40 {
 				name = name[:37] + "..."
 			}
-			// ДОБАВЛЯЕМ ВЫВОД ID
-			fmt.Printf("   🔴 %s (ID: %s)\n", name, contest.ID)
+			fmt.Printf("   🔵 %s (ID: %s)\n", name, contest.ID)
 		}
 	}
 
 	// Затем активные контесты
 	if len(active) > 0 {
-		fmt.Printf("\n🎯 Актуальные контесты (%d):\n", len(active))
+		fmt.Printf("\n🎯 Активные контесты (%d):\n", len(active))
 		for _, contest := range active {
-			// ДОБАВЛЯЕМ ВЫВОД ID
-			fmt.Printf("   🟢 %s (ID: %s)\n", contest.Name, contest.ID)
+			name := contest.Name
+			if len(name) > 40 {
+				name = name[:37] + "..."
+			}
+			fmt.Printf("   🟢 %s (ID: %s)\n", name, contest.ID)
 		}
 	} else {
-		fmt.Println("\n🎯 Актуальные контесты: нет активных контестов")
+		fmt.Println("\n🎯 Активные контесты: нет активных контестов")
+	}
+
+	// Затем архивные
+	if len(archive) > 0 {
+		fmt.Printf("\n📚 Архивные контесты (%d):\n", len(archive))
+		for i, contest := range archive {
+			if i >= 8 {
+				fmt.Printf("   ... и еще %d архивных контестов\n", len(archive)-8)
+				break
+			}
+			name := contest.Name
+			if len(name) > 40 {
+				name = name[:37] + "..."
+			}
+			fmt.Printf("   🔴 %s (ID: %s)\n", name, contest.ID)
+		}
 	}
 
 	fmt.Printf("\n💡 Команды:\n")
@@ -129,18 +147,24 @@ func (v *VSCodeExtension) handleContests() {
 	fmt.Printf("   sortme submit файл -c ID -p ID - отправить решение\n")
 
 	// Показываем пример с реальным ID из списка
-	if len(archive) > 0 {
-		fmt.Printf("   sortme problems %s         - пример\n", archive[0].ID)
+	if len(active) > 0 {
+		fmt.Printf("   sortme problems %s         - пример с активным контестом\n", active[0].ID)
+	} else if len(upcoming) > 0 {
+		fmt.Printf("   sortme problems %s         - пример с предстоящим контестом\n", upcoming[0].ID)
+	} else if len(archive) > 0 {
+		fmt.Printf("   sortme problems %s         - пример с архивным контестом\n", archive[0].ID)
 	}
 
-	// В конец handleContests добавим:
+	// Показываем все ID контестов
 	fmt.Printf("\n🔢 Все ID контестов: ")
-	for i, contest := range archive {
-		if i > 0 {
+	displayed := 0
+	for _, contest := range contests {
+		if displayed > 0 {
 			fmt.Printf(", ")
 		}
 		fmt.Printf("%s", contest.ID)
-		if i >= 10 { // Ограничиваем вывод
+		displayed++
+		if displayed >= 15 { // Ограничиваем вывод
 			fmt.Printf("...")
 			break
 		}
@@ -449,7 +473,6 @@ func getTaskDisplayName(sub Submission) string {
 	return fmt.Sprintf("%d", sub.ProblemID)
 }
 
-// В методе createProblemsCommand добавь вызов handleProblems
 func (v *VSCodeExtension) createProblemsCommand() *cobra.Command {
 	var contestID string
 
@@ -485,7 +508,63 @@ func (v *VSCodeExtension) createProblemsCommand() *cobra.Command {
 	return cmd
 }
 
-// В методе handleProblems изменим логику отображения статусов
+// Детальный метод для получения статуса задачи
+func (a *APIClient) GetTaskStatus(contestID string, taskID int) (solved bool, points int, submissionsCount int, err error) {
+	if !a.IsAuthenticated() {
+		return false, 0, 0, fmt.Errorf("not authenticated")
+	}
+
+	// Получаем все отправки для этой задачи
+	endpoint := fmt.Sprintf("/getMySubmissionsByTask?id=%d&contestid=%s", taskID, contestID)
+	submissions, err := a.tryGetSubmissions(endpoint, 0)
+	if err != nil {
+		return false, 0, 0, err
+	}
+
+	submissionsCount = len(submissions)
+	maxPoints := 0
+
+	// Ищем максимальный балл и проверяем решена ли задача
+	for _, submission := range submissions {
+		if submission.TotalPoints > maxPoints {
+			maxPoints = submission.TotalPoints
+		}
+
+		// Задача считается решенной если:
+		// 1. Вердикт = 1 (полное решение) И баллы = 100
+		// 2. ИЛИ баллы = 100 (некоторые системы)
+		// 3. ИЛИ вердикт текстовый содержит "accepted"
+		if submission.ShownVerdict == 1 && submission.TotalPoints == 100 {
+			solved = true
+		} else if submission.TotalPoints == 100 {
+			solved = true
+		} else if strings.Contains(strings.ToLower(submission.ShownVerdictText), "accepted") {
+			solved = true
+		}
+
+		// Если нашли полное решение, можно выйти раньше
+		if solved && maxPoints == 100 {
+			break
+		}
+	}
+
+	// Для некоторых контестов баллы > 0 могут считаться решением
+	if !solved && maxPoints > 0 {
+		// Проверяем контест - если это учебный, то частичное решение может считаться
+		contestInfo, err := a.GetContestInfo(contestID)
+		if err == nil && contestInfo != nil {
+			// Эвристика: если в названии есть "лабораторная" или "учебная", то частичное решение ок
+			if strings.Contains(strings.ToLower(contestInfo.Name), "лабораторная") ||
+				strings.Contains(strings.ToLower(contestInfo.Name), "учебная") ||
+				strings.Contains(strings.ToLower(contestInfo.Name), "training") {
+				solved = true
+			}
+		}
+	}
+
+	return solved, maxPoints, submissionsCount, nil
+}
+
 func (v *VSCodeExtension) handleProblems(contestID string) {
 	if !v.apiClient.IsAuthenticated() {
 		fmt.Println("❌ Вы не аутентифицированы")
@@ -507,8 +586,13 @@ func (v *VSCodeExtension) handleProblems(contestID string) {
 
 	fmt.Printf("\n📚 Задачи контеста \"%s\":\n", contestInfo.Name)
 
-	// Сначала собираем все статусы
-	taskStatuses := make([]string, len(contestInfo.Tasks))
+	// Сначала собираем все статусы с детальной информацией
+	taskStatuses := make([]struct {
+		solved      bool
+		points      int
+		submissions int
+	}, len(contestInfo.Tasks))
+
 	solvedCount := 0
 
 	for i, task := range contestInfo.Tasks {
@@ -517,23 +601,33 @@ func (v *VSCodeExtension) handleProblems(contestID string) {
 			time.Sleep(300 * time.Millisecond)
 		}
 
-		solved, err := v.apiClient.IsTaskSolved(contestID, task.ID)
+		solved, points, submissions, err := v.apiClient.GetTaskStatus(contestID, task.ID)
 		status := "❌" // По умолчанию не решена
 		if err != nil {
 			status = "❓" // Неизвестно из-за ошибки
-			fmt.Printf("  ⚠️  Ошибка проверки задачи %d: %v\n", task.ID, err)
+			fmt.Printf("  ⚠️ Ошибка проверки задачи %d: %v\n", task.ID, err)
 		} else if solved {
 			status = "✅" // Решена
 			solvedCount++
 		}
 
-		taskStatuses[i] = status
-	}
+		taskStatuses[i] = struct {
+			solved      bool
+			points      int
+			submissions int
+		}{solved, points, submissions}
 
-	// Теперь красивый вывод
-	for i, task := range contestInfo.Tasks {
-		status := taskStatuses[i]
-		fmt.Printf("  %s %d. %s (ID: %d)\n", status, i+1, task.Name, task.ID)
+		// Выводим задачу со статусом
+		pointsInfo := ""
+		if points > 0 {
+			pointsInfo = fmt.Sprintf(" (%d баллов)", points)
+		}
+		submissionsInfo := ""
+		if submissions > 0 {
+			submissionsInfo = fmt.Sprintf(" [%d попыток]", submissions)
+		}
+
+		fmt.Printf("  %s %d. %s%s%s (ID: %d)\n", status, i+1, task.Name, pointsInfo, submissionsInfo, task.ID)
 	}
 
 	fmt.Printf("\n💡 Для отправки решения используйте:\n")
@@ -751,14 +845,14 @@ func (v *VSCodeExtension) handleStatus(submissionID string) {
 	fmt.Printf("   🌐 Подробнее: https://sort-me.org/submission/%s\n", cleanID)
 }
 
+// Улучшенный метод для проверки решена ли задача
 func (a *APIClient) IsTaskSolved(contestID string, taskID int) (bool, error) {
 	if !a.IsAuthenticated() {
 		return false, fmt.Errorf("not authenticated")
 	}
 
-	endpoint := fmt.Sprintf("/getMySubmissionsByTask?id=%d", taskID)
-
-	// Получаем ВСЕ отправки для задачи
+	// Получаем все отправки для этой задачи
+	endpoint := fmt.Sprintf("/getMySubmissionsByTask?id=%d&contestid=%s", taskID, contestID)
 	submissions, err := a.tryGetSubmissions(endpoint, 0)
 	if err != nil {
 		return false, err
@@ -766,12 +860,22 @@ func (a *APIClient) IsTaskSolved(contestID string, taskID int) (bool, error) {
 
 	// Проверяем ВСЕ отправки на наличие успешной
 	for _, submission := range submissions {
-		// Успешная отправка - вердикт 1 (Полное решение) И баллы > 0
-		if submission.ShownVerdict == 1 && submission.TotalPoints > 0 {
-			return true, nil
+		// Успешная отправка - вердикт 1 (Полное решение) И баллы = 100
+		// ИЛИ вердикт 1 и баллы > 0 (частичное решение может считаться решенным)
+		if submission.ShownVerdict == 1 {
+			if submission.TotalPoints == 100 {
+				return true, nil // Полное решение
+			}
+			if submission.TotalPoints > 0 {
+				// Для некоторых контестов частичное решение может считаться решенным
+				fmt.Printf("   ⚠️ Задача %d: частичное решение (%d баллов)\n", taskID, submission.TotalPoints)
+				return true, nil
+			}
 		}
-		// Или если баллы = 100 (полное решение)
-		if submission.TotalPoints == 100 {
+
+		// Дополнительная проверка по текстовому вердикту
+		if strings.Contains(strings.ToLower(submission.ShownVerdictText), "accepted") ||
+			strings.Contains(strings.ToLower(submission.ShownVerdictText), "полное решение") {
 			return true, nil
 		}
 	}
